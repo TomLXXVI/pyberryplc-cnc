@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyberryplc-cnc"
+version = "0.1.0"
+description = "CNC adapters that compile python-robot trajectories to pyberryplc-stepper pulse trains."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+authors = [
+    { name = "Tom Christiaens", email = "mailbox.tom.chr@gmail.com" }
+]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.26,<3",
+    "pyberryplc-stepper==0.1.0",
+    "python-robot==0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
