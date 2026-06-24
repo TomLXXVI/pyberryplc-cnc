@@ -9,13 +9,13 @@ GPIO or Raspberry Pi driver code during offline trajectory compilation.
 
 from .trajectory import (
     AxisCalibration,
-    Direction,
+    RotationDirection,
     compile_xyz_samples,
     compile_xyz_stepper_trajectory,
     save_stepper_trajectory,
 )
 
 __all__ = [
-    "AxisCalibration", "Direction", "compile_xyz_samples",
+    "AxisCalibration", "RotationDirection", "compile_xyz_samples",
     "compile_xyz_stepper_trajectory", "save_stepper_trajectory",
 ]

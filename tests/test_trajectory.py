@@ -4,6 +4,7 @@ import numpy as np
 
 from pyberryplc_cnc import (
     AxisCalibration,
+    RotationDirection,
     compile_xyz_samples,
     compile_xyz_stepper_trajectory,
 )
@@ -67,6 +68,7 @@ def test_compile_linear_axis_to_delays_and_direction():
     assert len(trajectory) == 1
     delays, direction = trajectory[0]["x"]
     assert len(delays) == 10
+    assert isinstance(direction, RotationDirection)
     assert direction == "counterclockwise"
     assert all(math.isclose(delay, 0.1 - 20e-6) for delay in delays)
 

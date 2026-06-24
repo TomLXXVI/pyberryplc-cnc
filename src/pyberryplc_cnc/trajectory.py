@@ -7,10 +7,8 @@ linear axis displacement to motor microsteps using per-axis calibration data,
 splits motion when an axis changes direction, and returns JSON-ready segment
 dictionaries for ``XYZMotionController.load_trajectory()``.
 
-The compiler is intentionally independent from the concrete stepper driver
-classes. It emits serialized direction strings instead of importing
-``RotationDirection`` so trajectories can be prepared on a development machine
-without Raspberry Pi GPIO dependencies.
+The compiler depends only on the platform-independent
+``RotationDirection`` enum and does not import concrete GPIO driver classes.
 """
 
 from __future__ import annotations
@@ -18,22 +16,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Literal, Protocol, Sequence, Mapping
+from typing import Protocol, Sequence, Mapping
 
 import numpy as np
 
-Direction = Literal["counterclockwise", "clockwise"]
-"""
-Serialized motor direction value accepted by ``XYZMotionController``.
-
-The direction names match the values used by
-``pyberryplc_stepper.driver.RotationDirection`` while keeping this package free
-from stepper-driver imports.
-"""
-
-_CCW = "counterclockwise"
-_CW = "clockwise"
-_DIRECTION_ALIASES = {"counterclockwise": _CCW, "ccw": _CCW, "clockwise": _CW, "cw": _CW}
+from pyberryplc_stepper import RotationDirection
 
 
 class XYZTrajectoryScheme(Protocol):
@@ -96,7 +83,7 @@ class AxisCalibration:
     travel_per_rev: float
     full_steps_per_rev: int = 200
     microstep_factor: int = 1
-    positive_direction: Direction = _CCW
+    positive_direction: RotationDirection | str = RotationDirection.CCW
     step_width: float = 20e-6
 
     def __post_init__(self) -> None:
@@ -111,7 +98,9 @@ class AxisCalibration:
             raise ValueError("microstep_factor must be greater than zero.")
         if self.step_width < 0.0:
             raise ValueError("step_width cannot be negative.")
-        self.positive_direction = _normalize_direction(self.positive_direction)
+        self.positive_direction = RotationDirection.from_value(
+            self.positive_direction
+        )
 
     @property
     def steps_per_unit(self) -> float:
@@ -127,7 +116,7 @@ class AxisCalibration:
         """
         return 1.0 / self.steps_per_unit
 
-    def direction_for_delta(self, delta: float) -> Direction:
+    def direction_for_delta(self, delta: float) -> RotationDirection:
         """
         Return the motor direction for a signed axis displacement.
 
@@ -138,12 +127,15 @@ class AxisCalibration:
 
         Returns
         -------
-        Direction
-            Serialized motor direction for the displacement.
+        RotationDirection
+            Motor direction for the displacement.
         """
+        positive_direction = RotationDirection.from_value(
+            self.positive_direction
+        )
         if delta >= 0.0:
-            return self.positive_direction
-        return _opposite_direction(self.positive_direction)
+            return positive_direction
+        return ~positive_direction
 
 
 def compile_xyz_stepper_trajectory(
@@ -393,7 +385,7 @@ def _compile_axis_segment(
     t_arr: np.ndarray,
     coords: np.ndarray,
     calibration: AxisCalibration,
-) -> tuple[list[float], Direction]:
+) -> tuple[list[float], RotationDirection]:
     """
     Compile one monotonic axis segment to pulse delays and direction.
 
@@ -408,7 +400,7 @@ def _compile_axis_segment(
 
     Returns
     -------
-    tuple[list[float], Direction]
+    tuple[list[float], RotationDirection]
         Pulse delays in seconds and serialized motor direction.
     """
     delta = float(coords[-1] - coords[0])
@@ -430,47 +422,3 @@ def _compile_axis_segment(
     step_times = np.interp(step_positions, interp_coords, interp_t)
     delays = np.maximum(0.0, np.diff(step_times) - calibration.step_width)
     return delays.tolist(), direction
-
-
-def _normalize_direction(direction: object) -> Direction:
-    """
-    Normalize a direction alias to the serialized direction value.
-
-    Parameters
-    ----------
-    direction:
-        Direction string or string-like object.
-
-    Returns
-    -------
-    Direction
-        Normalized direction value.
-    """
-    key = str(direction).lower()
-    try:
-        return _DIRECTION_ALIASES[key]  # type: ignore[return-value]
-    except KeyError as exc:
-        raise ValueError(
-            "positive_direction must be 'counterclockwise', 'ccw', "
-            "'clockwise', or 'cw'."
-        ) from exc
-
-
-# noinspection PyTypeChecker
-def _opposite_direction(direction: Direction) -> Direction:
-    """
-    Return the opposite serialized motor direction.
-
-    Parameters
-    ----------
-    direction:
-        Direction to invert.
-
-    Returns
-    -------
-    Direction
-        Opposite direction.
-    """
-    if direction == _CCW:
-        return _CW
-    return _CCW
