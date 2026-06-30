@@ -6,7 +6,7 @@ JSON-compatible step-pulse format consumed by
 :class:`pyberryplc_stepper.controller.XYZMotionController`.
 """
 
-from .trajectory import (
+from .trajectory_compiler import (
     AxisCalibration,
     CompiledXYZTrajectory,
     RotationDirection,

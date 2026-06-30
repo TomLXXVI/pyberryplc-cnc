@@ -12,7 +12,7 @@ from pathlib import Path
 
 from nicegui import ui
 
-from .trajectory import compile_xyz_path
+from .trajectory_compiler import compile_xyz_path
 
 
 @dataclass
