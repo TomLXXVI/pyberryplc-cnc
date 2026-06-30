@@ -1,14 +1,17 @@
 """
-Compile sampled XYZ trajectories to stepper pulse-train data.
+Compile blended Cartesian CNC paths to stepper pulse-train data.
 
 This module forms the bridge between ``python_robot.motion`` and
-``pyberryplc-stepper``. It works with sampled Cartesian trajectories, converts
-linear axis displacement to motor microsteps using per-axis calibration data,
-splits motion when an axis changes direction, and returns JSON-ready segment
-dictionaries for ``XYZMotionController.load_trajectory()``.
+``pyberryplc-stepper``. The preferred workflow is:
 
-The compiler depends only on the platform-independent
-``RotationDirection`` enum and does not import concrete GPIO driver classes.
+1. define an XYZ path as Cartesian vertices,
+2. build a :class:`python_robot.motion.cartesian_space.BlendedPoseVectorProfile`,
+3. compile the profile pieces analytically to the JSON-ready format consumed by
+   :class:`pyberryplc_stepper.controller.XYZMotionController`.
+
+The motor calibration is loaded from the same TOML file used by
+``XYZMotionController``. This keeps pin configuration, microstepping, axis pitch,
+and axis direction in one place.
 """
 
 from __future__ import annotations
@@ -16,41 +19,224 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Protocol, Sequence, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from pyberryplc_stepper import RotationDirection
+try:  # pragma: no cover - Python 3.11+ path.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback.
+    import tomli as tomllib
+
+from pyberryplc_stepper.rotation_direction import RotationDirection
+from python_robot.motion.cartesian_space import (
+    BlendedPoseVectorProfile,
+    PoseProfileSegment,
+)
 
 
-class XYZTrajectoryScheme(Protocol):
-    """Small structural protocol implemented by python_robot Cartesian schemes."""
+MICROSTEP_FACTORS = {
+    "full": 1,
+    "1/2": 2,
+    "1/4": 4,
+    "1/8": 8,
+    "1/16": 16,
+    "1/32": 32,
+    "1/64": 64,
+    "1/128": 128,
+    "1/256": 256,
+}
+TIME_TOL = 1.0e-12
+
+
+@dataclass(frozen=True)
+class XYZVertex:
+    """
+    Cartesian vertex of a CNC path.
+
+    Parameters
+    ----------
+    x:
+        X-coordinate of the path vertex.
+    y:
+        Y-coordinate of the path vertex.
+    z:
+        Z-coordinate of the path vertex.
+    """
+
+    x: float
+    y: float
+    z: float
+
+    @classmethod
+    def from_sequence(cls, values: Sequence[float]) -> "XYZVertex":
+        """
+        Create a vertex from a three-value sequence.
+
+        Parameters
+        ----------
+        values:
+            Sequence containing ``x``, ``y``, and ``z`` coordinates.
+
+        Returns
+        -------
+        XYZVertex
+            Vertex with float coordinates.
+        """
+        if len(values) != 3:
+            raise ValueError("An XYZ vertex must contain exactly three values.")
+        return cls(float(values[0]), float(values[1]), float(values[2]))
+
+    def as_tuple(self) -> tuple[float, float, float]:
+        """
+        Return the vertex as an ``(x, y, z)`` tuple.
+
+        Returns
+        -------
+        tuple[float, float, float]
+            Coordinates of this vertex.
+        """
+        return self.x, self.y, self.z
+
+    def to_pose_vector(self) -> tuple[float, float, float, float, float, float]:
+        """
+        Return this vertex as a six-dimensional pose vector.
+
+        Returns
+        -------
+        tuple[float, float, float, float, float, float]
+            Pose vector ``(x, y, z, 0, 0, 0)``. CNC paths only use translation;
+            orientation is kept fixed.
+        """
+        return self.x, self.y, self.z, 0.0, 0.0, 0.0
+
+
+@dataclass(frozen=True)
+class XYZPath:
+    """
+    Cartesian CNC path defined by XYZ vertices.
+
+    Parameters
+    ----------
+    vertices:
+        Sequence of :class:`XYZVertex` objects or ``(x, y, z)`` sequences.
+    """
+
+    vertices: Sequence[XYZVertex | Sequence[float]]
 
     @property
-    def time_samples(self) -> np.ndarray:
+    def xyz_vertices(self) -> tuple[XYZVertex, ...]:
         """
-        Return the sampled trajectory times.
+        Return normalized path vertices.
+
+        Returns
+        -------
+        tuple[XYZVertex, ...]
+            Vertices converted to :class:`XYZVertex` instances.
+        """
+        vertices = tuple(
+            vertex
+            if isinstance(vertex, XYZVertex)
+            else XYZVertex.from_sequence(vertex)
+            for vertex in self.vertices
+        )
+        if len(vertices) < 2:
+            raise ValueError("At least two XYZ vertices are required.")
+        return vertices
+
+    @property
+    def points(self) -> np.ndarray:
+        """
+        Return the path vertices as an ``(n, 3)`` array.
 
         Returns
         -------
         np.ndarray
-            One-dimensional array with strictly increasing time values in
-            seconds.
+            XYZ coordinates of all path vertices.
         """
-        ...
+        return np.asarray(
+            [vertex.as_tuple() for vertex in self.xyz_vertices],
+            dtype=float,
+        )
 
     @property
-    def trajectory_points(self) -> np.ndarray:
+    def pose_vectors(self) -> np.ndarray:
         """
-        Return the sampled Cartesian trajectory points.
+        Return path vertices as six-dimensional pose vectors.
 
         Returns
         -------
         np.ndarray
-            Two-dimensional array whose first three columns contain the sampled
-            X, Y, and Z coordinates.
+            Array with rows ``(x, y, z, 0, 0, 0)``.
         """
-        ...
+        return np.asarray(
+            [vertex.to_pose_vector() for vertex in self.xyz_vertices],
+            dtype=float,
+        )
+
+    @property
+    def segment_distances(self) -> np.ndarray:
+        """
+        Return Euclidean distances between successive vertices.
+
+        Returns
+        -------
+        np.ndarray
+            One distance per Cartesian path segment.
+        """
+        return np.linalg.norm(np.diff(self.points, axis=0), axis=1)
+
+    def segment_durations(self, feed_rate: float) -> tuple[float, ...]:
+        """
+        Calculate segment durations from a constant Cartesian feed rate.
+
+        Parameters
+        ----------
+        feed_rate:
+            Cartesian feed rate in path coordinate units per second.
+
+        Returns
+        -------
+        tuple[float, ...]
+            Duration of every path segment in seconds.
+        """
+        if feed_rate <= 0.0:
+            raise ValueError("feed_rate must be greater than zero.")
+
+        distances = self.segment_distances
+        if np.any(distances <= 0.0):
+            raise ValueError("Successive XYZ vertices must not be identical.")
+
+        return tuple(float(distance / feed_rate) for distance in distances)
+
+
+@dataclass(frozen=True)
+class CompiledXYZTrajectory:
+    """
+    Result of compiling an XYZ path for ``XYZMotionController``.
+
+    Parameters
+    ----------
+    profile:
+        Blended pose-vector profile used for the CNC path.
+    stepper_trajectory:
+        JSON-ready list of motion segments for
+        ``XYZMotionController.load_trajectory()``.
+    """
+
+    profile: BlendedPoseVectorProfile
+    stepper_trajectory: list[dict[str, list]]
+
+    def save(self, filepath: str | Path) -> None:
+        """
+        Save the compiled stepper trajectory as JSON.
+
+        Parameters
+        ----------
+        filepath:
+            Destination JSON file.
+        """
+        save_stepper_trajectory(filepath, self.stepper_trajectory)
 
 
 @dataclass
@@ -62,18 +248,15 @@ class AxisCalibration:
     ----------
     travel_per_rev:
         Linear travel distance of the axis for one motor revolution. The unit
-        must match the trajectory coordinate unit, for example meters per
-        revolution or millimeters per revolution.
+        must match the path coordinate unit.
     full_steps_per_rev:
         Number of full motor steps in one revolution before microstepping is
         applied.
     microstep_factor:
-        Number of microsteps per full step. For example, ``16`` for ``1/16``
-        microstepping.
+        Number of microsteps per full step.
     positive_direction:
         Motor direction that moves the axis in the positive coordinate
-        direction. Accepted values are ``"counterclockwise"``, ``"ccw"``,
-        ``"clockwise"``, and ``"cw"``.
+        direction.
     step_width:
         STEP pulse width in seconds. This value is subtracted from each
         interval between successive step times because the pulse itself consumes
@@ -102,17 +285,80 @@ class AxisCalibration:
             self.positive_direction
         )
 
+    @classmethod
+    def from_pitch(
+        cls,
+        pitch: float,
+        *,
+        full_steps_per_rev: int = 200,
+        microstep_factor: int = 1,
+        positive_direction: RotationDirection | str = RotationDirection.CCW,
+        step_width: float = 20e-6,
+    ) -> "AxisCalibration":
+        """
+        Create calibration data from an axis pitch.
+
+        Parameters
+        ----------
+        pitch:
+            Axis pitch in motor revolutions per path coordinate unit.
+        full_steps_per_rev:
+            Number of full motor steps per revolution.
+        microstep_factor:
+            Number of microsteps per full step.
+        positive_direction:
+            Motor direction corresponding to positive axis movement.
+        step_width:
+            STEP pulse width in seconds.
+
+        Returns
+        -------
+        AxisCalibration
+            Calibration data equivalent to the supplied pitch.
+        """
+        if pitch <= 0.0:
+            raise ValueError("pitch must be greater than zero.")
+        return cls(
+            travel_per_rev=1.0 / pitch,
+            full_steps_per_rev=full_steps_per_rev,
+            microstep_factor=microstep_factor,
+            positive_direction=positive_direction,
+            step_width=step_width,
+        )
+
+    @property
+    def pitch(self) -> float:
+        """
+        Return the axis pitch in revolutions per path coordinate unit.
+
+        Returns
+        -------
+        float
+            Motor revolutions per coordinate unit.
+        """
+        return 1.0 / self.travel_per_rev
+
     @property
     def steps_per_unit(self) -> float:
         """
-        Number of microsteps needed for one trajectory coordinate unit.
+        Return the number of microsteps for one coordinate unit.
+
+        Returns
+        -------
+        float
+            Microsteps per path coordinate unit.
         """
-        return self.full_steps_per_rev * self.microstep_factor / self.travel_per_rev
+        return self.full_steps_per_rev * self.microstep_factor * self.pitch
 
     @property
     def unit_per_step(self) -> float:
         """
-        Linear axis travel represented by one microstep.
+        Return the linear travel represented by one microstep.
+
+        Returns
+        -------
+        float
+            Coordinate units per microstep.
         """
         return 1.0 / self.steps_per_unit
 
@@ -138,108 +384,225 @@ class AxisCalibration:
         return ~positive_direction
 
 
-def compile_xyz_stepper_trajectory(
-    scheme: XYZTrajectoryScheme,
-    calibrations: Mapping[str, AxisCalibration],
-    *,
+def load_axis_calibrations_from_toml(
+    filepath: str | Path,
     axes: Sequence[str] = ("x", "y", "z"),
-    include_stationary_axes: bool = True,
-) -> list[dict[str, list]]:
+    *,
+    step_width: float = 20e-6,
+) -> dict[str, AxisCalibration]:
     """
-    Compile a python_robot Cartesian trajectory scheme to XYZMotionController
-    data.
+    Load CNC axis calibrations from a motor configuration TOML file.
 
     Parameters
     ----------
-    scheme:
-        Object exposing ``time_samples`` and ``trajectory_points``. This matches
-        the public surface of ``python_robot.motion.CartesianSpaceScheme``.
-    calibrations:
-        Mapping from axis name (``"x"``, ``"y"``, ``"z"``) to the calibration
-        that converts linear travel to motor microsteps.
+    filepath:
+        TOML file used by ``XYZMotionController``.
     axes:
-        Axes to include, in coordinate-column order. Unknown axes raise a
-        ``ValueError``.
-    include_stationary_axes:
-        If True, include axes with no movement as empty pulse trains. This
-        preserves a stable segment shape for ``XYZMotionController``.
+        Axis names to load. Valid values are ``"x"``, ``"y"``, and ``"z"``.
+    step_width:
+        STEP pulse width in seconds.
 
     Returns
     -------
-    list[dict[str, list]]
-        JSON-ready trajectory segments. Each segment maps an axis name to
-        ``[delays, direction]``.
+    dict[str, AxisCalibration]
+        Calibration data keyed by axis name.
     """
-    return compile_xyz_samples(
-        t_samples=scheme.time_samples,
-        trajectory_points=scheme.trajectory_points,
-        calibrations=calibrations,
-        axes=axes,
-        include_stationary_axes=include_stationary_axes,
+    _axis_indices(axes)
+    config = _load_toml(filepath)
+    calibrations: dict[str, AxisCalibration] = {}
+
+    for axis in axes:
+        section_name = f"{axis}_motor"
+        motor_config: dict = config.get(section_name, dict())
+        if motor_config is None:
+            continue
+
+        pitch = float(_required_key(motor_config, "pitch", section_name))
+        rdir_ref = _required_key(motor_config, "rdir_ref", section_name)
+        microstepping = _required_key(
+            motor_config,
+            "microstepping",
+            section_name,
+        )
+        if not isinstance(microstepping, Mapping):
+            raise ValueError(f"{section_name}.microstepping must be a table.")
+
+        resolution = str(
+            _required_key(microstepping, "resolution", f"{section_name}.microstepping")
+        )
+        full_steps_per_rev = int(
+            _required_key(
+                microstepping,
+                "full_steps_per_rev",
+                f"{section_name}.microstepping",
+            )
+        )
+
+        calibrations[axis] = AxisCalibration.from_pitch(
+            pitch=pitch,
+            full_steps_per_rev=full_steps_per_rev,
+            microstep_factor=_microstep_factor_from_resolution(resolution),
+            positive_direction=str(rdir_ref),
+            step_width=step_width,
+        )
+
+    return calibrations
+
+
+def create_blended_xyz_profile(
+    vertices: Sequence[XYZVertex | Sequence[float]],
+    *,
+    dt_segments: Sequence[float] | None = None,
+    feed_rate: float | None = None,
+    dt_blends: float | Sequence[float] = 0.0,
+) -> BlendedPoseVectorProfile:
+    """
+    Create a blended pose-vector profile from XYZ path vertices.
+
+    Parameters
+    ----------
+    vertices:
+        Cartesian path vertices.
+    dt_segments:
+        Optional duration of each path segment in seconds.
+    feed_rate:
+        Optional Cartesian feed rate. Used to derive ``dt_segments`` when
+        explicit segment durations are not supplied.
+    dt_blends:
+        Blend time at each path point, or one value applied to all path points.
+
+    Returns
+    -------
+    BlendedPoseVectorProfile
+        Profile that can be compiled to stepper pulse trains.
+    """
+    path = XYZPath(vertices)
+    if dt_segments is None:
+        if feed_rate is None:
+            raise ValueError("Either dt_segments or feed_rate must be provided.")
+        dt_segments = path.segment_durations(feed_rate)
+    elif feed_rate is not None:
+        raise ValueError("Specify either dt_segments or feed_rate, not both.")
+
+    return BlendedPoseVectorProfile(
+        pose_vectors=path.pose_vectors,
+        dt_segments=dt_segments,
+        dt_blends=dt_blends,
     )
 
 
-def compile_xyz_samples(
-    t_samples: Sequence[float],
-    trajectory_points: Sequence[Sequence[float]],
+def compile_xyz_path(
+    vertices: Sequence[XYZVertex | Sequence[float]],
+    motor_config_filepath: str | Path,
+    *,
+    dt_segments: Sequence[float] | None = None,
+    feed_rate: float | None = None,
+    dt_blends: float | Sequence[float] = 0.0,
+    axes: Sequence[str] = ("x", "y", "z"),
+    include_stationary_axes: bool = True,
+) -> CompiledXYZTrajectory:
+    """
+    Compile an XYZ vertex path using a ``XYZMotionController`` motor config.
+
+    Parameters
+    ----------
+    vertices:
+        Cartesian path vertices.
+    motor_config_filepath:
+        TOML file used by ``XYZMotionController``.
+    dt_segments:
+        Optional segment durations in seconds.
+    feed_rate:
+        Optional Cartesian feed rate used to derive segment durations.
+    dt_blends:
+        Blend time at each path point, or one value applied to all path points.
+    axes:
+        Axis names to compile.
+    include_stationary_axes:
+        If True, include axes with no motion in every JSON segment.
+
+    Returns
+    -------
+    CompiledXYZTrajectory
+        Profile and JSON-ready stepper trajectory.
+    """
+    calibrations = load_axis_calibrations_from_toml(
+        motor_config_filepath,
+        axes=axes,
+    )
+    profile = create_blended_xyz_profile(
+        vertices,
+        dt_segments=dt_segments,
+        feed_rate=feed_rate,
+        dt_blends=dt_blends,
+    )
+    stepper_trajectory = compile_blended_profile(
+        profile,
+        calibrations,
+        axes=axes,
+        include_stationary_axes=include_stationary_axes,
+    )
+    return CompiledXYZTrajectory(
+        profile=profile,
+        stepper_trajectory=stepper_trajectory,
+    )
+
+
+def compile_blended_profile(
+    profile: BlendedPoseVectorProfile,
     calibrations: Mapping[str, AxisCalibration],
     *,
     axes: Sequence[str] = ("x", "y", "z"),
     include_stationary_axes: bool = True,
 ) -> list[dict[str, list]]:
     """
-    Convert sampled XYZ positions to JSON-ready per-axis pulse trains.
+    Compile a blended Cartesian profile to stepper-controller JSON data.
 
     Parameters
     ----------
-    t_samples:
-        Strictly increasing time samples in seconds.
-    trajectory_points:
-        Sampled Cartesian positions. The first three columns are interpreted as
-        X, Y, and Z coordinates.
+    profile:
+        Blended pose-vector profile. The first three pose-vector components are
+        interpreted as X, Y, and Z.
     calibrations:
-        Per-axis calibration settings for the axes that should be compiled.
+        Per-axis calibration settings.
     axes:
-        Axis identifiers to consider. Valid values are ``"x"``, ``"y"``, and
-        ``"z"``.
+        Axis names to compile.
     include_stationary_axes:
-        If True, include stationary configured axes as ``[[], direction]`` in
-        each segment.
+        If True, include axes with no movement as empty pulse trains.
 
     Returns
     -------
     list[dict[str, list]]
-        List of trajectory segments suitable for
+        JSON-ready trajectory segments for
         ``XYZMotionController.load_trajectory(trajectory=...)``.
-
-    Notes
-    -----
-    A segment is split whenever any configured axis changes displacement sign,
-    because a single stepper command can only have one direction per axis.
     """
-    t_arr, p_arr = _validate_samples(t_samples, trajectory_points)
     axis_indices = _axis_indices(axes)
     active_axes = tuple(axis for axis in axes if axis in calibrations)
-    boundaries = _split_boundaries_on_direction_changes(p_arr, axis_indices)
+    if not active_axes:
+        raise ValueError("No calibrated axes are available for compilation.")
 
     trajectory: list[dict[str, list]] = []
-    for start, stop in zip(boundaries[:-1], boundaries[1:]):
-        segment_t = t_arr[start : stop + 1]
-        segment_points = p_arr[start : stop + 1]
-        compiled_segment: dict[str, list] = {}
+    for piece in profile.pieces:
+        for tau_start, tau_stop in _piece_monotonic_intervals(
+            piece,
+            active_axes,
+            axis_indices,
+        ):
+            compiled_segment: dict[str, list] = {}
 
-        for axis in active_axes:
-            axis_index = axis_indices[axis]
-            delays, direction = _compile_axis_segment(
-                segment_t,
-                segment_points[:, axis_index],
-                calibrations[axis],
-            )
-            if delays or include_stationary_axes:
-                compiled_segment[axis] = [delays, direction]
+            for axis in active_axes:
+                delays, direction = _compile_axis_piece_interval(
+                    piece=piece,
+                    axis_index=axis_indices[axis],
+                    tau_start=tau_start,
+                    tau_stop=tau_stop,
+                    calibration=calibrations[axis],
+                )
+                if delays or include_stationary_axes:
+                    compiled_segment[axis] = [delays, direction]
 
-        if compiled_segment:
-            trajectory.append(compiled_segment)
+            if compiled_segment:
+                trajectory.append(compiled_segment)
 
     return trajectory
 
@@ -249,54 +612,295 @@ def save_stepper_trajectory(
     trajectory: list[dict[str, list]],
 ) -> None:
     """
-    Save compiled XYZMotionController trajectory data as JSON.
+    Save compiled ``XYZMotionController`` trajectory data as JSON.
 
     Parameters
     ----------
     filepath:
         Output JSON file path.
     trajectory:
-        JSON-ready trajectory as returned by ``compile_xyz_samples()`` or
-        ``compile_xyz_stepper_trajectory()``.
+        JSON-ready trajectory.
     """
     with Path(filepath).open("w", encoding="utf-8") as fh:
         json.dump(trajectory, fh, indent=2)
 
 
-def _validate_samples(
-    t_samples: Sequence[float],
-    trajectory_points: Sequence[Sequence[float]],
-) -> tuple[np.ndarray, np.ndarray]:
+def _load_toml(filepath: str | Path) -> dict[str, Any]:
     """
-    Validate and normalize raw trajectory samples.
+    Load a TOML file.
 
     Parameters
     ----------
-    t_samples:
-        Raw time samples.
-    trajectory_points:
-        Raw sampled Cartesian points.
+    filepath:
+        Path to a TOML file.
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
-        Normalized time array and XYZ point array.
+    dict[str, Any]
+        Parsed TOML content.
     """
-    t_arr = np.asarray(t_samples, dtype=float)
-    p_arr = np.asarray(trajectory_points, dtype=float)
+    with Path(filepath).open("rb") as fh:
+        return tomllib.load(fh)
 
-    if t_arr.ndim != 1:
-        raise ValueError("t_samples must be a 1D sequence.")
-    if p_arr.ndim != 2 or p_arr.shape[1] < 3:
-        raise ValueError("trajectory_points must have shape (n, 3) or wider.")
-    if len(t_arr) != len(p_arr):
-        raise ValueError("t_samples and trajectory_points must have the same length.")
-    if len(t_arr) < 2:
-        raise ValueError("At least two trajectory samples are required.")
-    if np.any(np.diff(t_arr) <= 0.0):
-        raise ValueError("t_samples must be strictly increasing.")
 
-    return t_arr, p_arr[:, :3]
+def _required_key(
+    mapping: Mapping[str, Any],
+    key: str,
+    section_name: str,
+) -> Any:
+    """
+    Return a required key from a mapping.
+
+    Parameters
+    ----------
+    mapping:
+        Mapping to inspect.
+    key:
+        Required key.
+    section_name:
+        Name used in the error message.
+
+    Returns
+    -------
+    Any
+        Value stored under ``key``.
+    """
+    try:
+        return mapping[key]
+    except KeyError as exc:
+        raise KeyError(f"Missing required key: {section_name}.{key}") from exc
+
+
+def _microstep_factor_from_resolution(resolution: str) -> int:
+    """
+    Convert a microstep resolution string to its numeric factor.
+
+    Parameters
+    ----------
+    resolution:
+        Resolution string such as ``"full"`` or ``"1/16"``.
+
+    Returns
+    -------
+    int
+        Microstep factor.
+    """
+    try:
+        return MICROSTEP_FACTORS[resolution]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported microstep resolution: {resolution!r}."
+        ) from exc
+
+
+def _piece_monotonic_intervals(
+    piece: PoseProfileSegment,
+    axes: Sequence[str],
+    axis_indices: Mapping[str, int],
+) -> list[tuple[float, float]]:
+    """
+    Split a profile piece where any configured axis changes direction.
+
+    Parameters
+    ----------
+    piece:
+        Profile piece whose coordinate functions are quadratic in local time.
+    axes:
+        Active axis names.
+    axis_indices:
+        Mapping from axis names to pose-vector indices.
+
+    Returns
+    -------
+    list[tuple[float, float]]
+        Local-time intervals within the piece.
+    """
+    bounds = [0.0, float(piece.dt)]
+    for axis in axes:
+        axis_index = axis_indices[axis]
+        acceleration = float(piece.a[axis_index])
+        if abs(acceleration) <= TIME_TOL:
+            continue
+
+        velocity = float(piece.v0[axis_index])
+        tau_zero = -velocity / acceleration
+        if TIME_TOL < tau_zero < piece.dt - TIME_TOL:
+            bounds.append(float(tau_zero))
+
+    unique_bounds = sorted(set(round(bound, 15) for bound in bounds))
+    return [
+        (start, stop)
+        for start, stop in zip(unique_bounds[:-1], unique_bounds[1:])
+        if stop - start > TIME_TOL
+    ]
+
+
+def _compile_axis_piece_interval(
+    piece: PoseProfileSegment,
+    axis_index: int,
+    tau_start: float,
+    tau_stop: float,
+    calibration: AxisCalibration,
+) -> tuple[list[float], RotationDirection]:
+    """
+    Compile one monotonic profile-piece interval for one axis.
+
+    Parameters
+    ----------
+    piece:
+        Profile piece to compile.
+    axis_index:
+        Pose-vector index of the axis.
+    tau_start:
+        Start time within the piece.
+    tau_stop:
+        Stop time within the piece.
+    calibration:
+        Axis calibration.
+
+    Returns
+    -------
+    tuple[list[float], RotationDirection]
+        STEP delays and axis direction.
+    """
+    q_start = _axis_position_at(piece, axis_index, tau_start)
+    q_stop = _axis_position_at(piece, axis_index, tau_stop)
+    delta = q_stop - q_start
+    direction = calibration.direction_for_delta(delta)
+    num_steps = int(round(abs(delta) * calibration.steps_per_unit))
+    if num_steps == 0:
+        return [], direction
+
+    step_positions = np.linspace(q_start, q_stop, num_steps + 1)
+    tau_values = [tau_start]
+    for step_position in step_positions[1:-1]:
+        tau_values.append(
+            _solve_tau_for_axis_position(
+                piece,
+                axis_index,
+                float(step_position),
+                tau_start,
+                tau_stop,
+            )
+        )
+    tau_values.append(tau_stop)
+
+    delays = np.maximum(0.0, np.diff(tau_values) - calibration.step_width)
+    return delays.tolist(), direction
+
+
+def _axis_position_at(
+    piece: PoseProfileSegment,
+    axis_index: int,
+    tau: float,
+) -> float:
+    """
+    Return one axis position at local piece time ``tau``.
+
+    Parameters
+    ----------
+    piece:
+        Profile piece.
+    axis_index:
+        Pose-vector axis index.
+    tau:
+        Local time within the piece.
+
+    Returns
+    -------
+    float
+        Axis coordinate.
+    """
+    return float(
+        piece.x0[axis_index]
+        + piece.v0[axis_index] * tau
+        + 0.5 * piece.a[axis_index] * tau**2
+    )
+
+
+def _solve_tau_for_axis_position(
+    piece: PoseProfileSegment,
+    axis_index: int,
+    position: float,
+    tau_start: float,
+    tau_stop: float,
+) -> float:
+    """
+    Solve the local time at which an axis reaches a position.
+
+    Parameters
+    ----------
+    piece:
+        Profile piece.
+    axis_index:
+        Pose-vector axis index.
+    position:
+        Target axis position.
+    tau_start:
+        Lower local-time bound.
+    tau_stop:
+        Upper local-time bound.
+
+    Returns
+    -------
+    float
+        Local time inside ``[tau_start, tau_stop]``.
+    """
+    x0 = float(piece.x0[axis_index])
+    v0 = float(piece.v0[axis_index])
+    a = float(piece.a[axis_index])
+
+    if abs(a) <= TIME_TOL:
+        if abs(v0) <= TIME_TOL:
+            return tau_start
+        tau = (position - x0) / v0
+        return _clamp(tau, tau_start, tau_stop)
+
+    discriminant = v0**2 - 2.0 * a * (x0 - position)
+    if discriminant < 0.0 and abs(discriminant) <= TIME_TOL:
+        discriminant = 0.0
+    if discriminant < 0.0:
+        raise ValueError("Axis position is outside the profile piece.")
+
+    sqrt_discriminant = float(np.sqrt(discriminant))
+    candidates = [
+        (-v0 - sqrt_discriminant) / a,
+        (-v0 + sqrt_discriminant) / a,
+    ]
+    valid = [
+        tau
+        for tau in candidates
+        if tau_start - TIME_TOL <= tau <= tau_stop + TIME_TOL
+    ]
+    if not valid:
+        closest = min(
+            candidates,
+            key=lambda tau_: min(abs(tau_ - tau_start), abs(tau_ - tau_stop)),
+        )
+        return _clamp(closest, tau_start, tau_stop)
+
+    return _clamp(valid[0], tau_start, tau_stop)
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    """
+    Clamp a value to a closed interval.
+
+    Parameters
+    ----------
+    value:
+        Value to clamp.
+    lower:
+        Lower bound.
+    upper:
+        Upper bound.
+
+    Returns
+    -------
+    float
+        Clamped value.
+    """
+    return min(max(float(value), lower), upper)
 
 
 def _axis_indices(axes: Sequence[str]) -> dict[str, int]:
@@ -319,106 +923,3 @@ def _axis_indices(axes: Sequence[str]) -> dict[str, int]:
         raise ValueError(f"Unknown CNC axes: {sorted(unknown)}.")
     return {axis: valid_indices[axis] for axis in axes}
 
-
-def _split_boundaries_on_direction_changes(
-    points: np.ndarray,
-    axis_indices: Mapping[str, int],
-) -> list[int]:
-    """
-    Find segment boundaries where any configured axis reverses direction.
-
-    Parameters
-    ----------
-    points:
-        XYZ trajectory point array.
-    axis_indices:
-        Mapping from axis identifier to coordinate-column index.
-
-    Returns
-    -------
-    list[int]
-        Sorted sample indices that delimit monotonic-direction segments. The
-        first and last sample are always included.
-    """
-    breaks: list[int] = []
-    for axis_index in axis_indices.values():
-        signs = _effective_displacement_signs(np.diff(points[:, axis_index]))
-        flips = np.where(signs[1:] * signs[:-1] == -1)[0] + 1
-        breaks.extend(int(index) for index in flips)  #type: ignore
-
-    boundaries = {0, len(points) - 1, *breaks}
-    return sorted(boundaries)
-
-
-def _effective_displacement_signs(displacements: np.ndarray) -> np.ndarray:
-    """
-    Return displacement signs while bridging zero-displacement runs.
-
-    Parameters
-    ----------
-    displacements:
-        Consecutive displacement values for one axis.
-
-    Returns
-    -------
-    np.ndarray
-        Integer sign array. Zero runs are filled from neighboring non-zero
-        signs so direction changes across stationary samples are still detected.
-    """
-    signs = np.sign(displacements).astype(int)
-    if len(signs) == 0:
-        return signs
-
-    for i in range(1, len(signs)):
-        if signs[i] == 0:
-            signs[i] = signs[i - 1]
-
-    if signs[0] == 0:
-        nonzero = np.flatnonzero(signs)
-        if nonzero.size:
-            signs[: nonzero[0]] = signs[nonzero[0]]
-
-    return signs
-
-
-def _compile_axis_segment(
-    t_arr: np.ndarray,
-    coords: np.ndarray,
-    calibration: AxisCalibration,
-) -> tuple[list[float], RotationDirection]:
-    """
-    Compile one monotonic axis segment to pulse delays and direction.
-
-    Parameters
-    ----------
-    t_arr:
-        Time samples for this segment.
-    coords:
-        Axis coordinates for this segment.
-    calibration:
-        Axis calibration used to convert coordinate travel to microsteps.
-
-    Returns
-    -------
-    tuple[list[float], RotationDirection]
-        Pulse delays in seconds and serialized motor direction.
-    """
-    delta = float(coords[-1] - coords[0])
-    direction = calibration.direction_for_delta(delta)
-    num_steps = int(round(abs(delta) * calibration.steps_per_unit))
-    if num_steps == 0:
-        return [], direction
-
-    step_distance = calibration.unit_per_step
-    sign = 1.0 if delta >= 0.0 else -1.0
-    step_positions = coords[0] + sign * step_distance * np.arange(num_steps + 1)
-
-    interp_coords = coords
-    interp_t = t_arr
-    if coords[-1] < coords[0]:
-        interp_coords = coords[::-1]
-        interp_t = t_arr[::-1]
-
-    step_times = np.interp(step_positions, interp_coords, interp_t)
-    delays = np.maximum(0.0, np.diff(step_times) - calibration.step_width)
-    return delays.tolist(), direction

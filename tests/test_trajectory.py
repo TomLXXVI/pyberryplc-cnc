@@ -1,133 +1,134 @@
 import math
 
-import numpy as np
-
 from pyberryplc_cnc import (
     AxisCalibration,
     RotationDirection,
-    compile_xyz_samples,
-    compile_xyz_stepper_trajectory,
+    compile_blended_profile,
+    compile_xyz_path,
+    create_blended_xyz_profile,
+    load_axis_calibrations_from_toml,
 )
 
 
-class FakeScheme:
+def _write_motor_config(tmp_path):
     """
-    Minimal python_robot-like trajectory scheme for adapter tests.
+    Write a minimal XYZMotionController-style motor configuration.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest temporary path fixture.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the generated TOML file.
     """
-
-    def __init__(self, t_samples, trajectory_points):
+    config_path = tmp_path / "motor_config.toml"
+    config_path.write_text(
         """
-        Store trajectory samples as NumPy arrays.
+[x_motor]
+step_pin_ID = 27
+dir_pin_ID = 17
+comm_port = "/dev/ttyUSB1"
+pitch = 0.25
+rdir_ref = "clockwise"
 
-        Parameters
-        ----------
-        t_samples:
-            Raw time samples.
-        trajectory_points:
-            Raw XYZ trajectory samples.
-        """
-        self._t_samples = np.asarray(t_samples, dtype=float)
-        self._trajectory_points = np.asarray(trajectory_points, dtype=float)
+[x_motor.microstepping]
+resolution = "full"
+full_steps_per_rev = 200
 
-    @property
-    def time_samples(self):
-        """
-        Return test trajectory time samples.
-        """
-        return self._t_samples
+[x_motor.current]
+run_current_pct = 77.0
+hold_current_pct = 10.0
 
-    @property
-    def trajectory_points(self):
-        """
-        Return test trajectory points.
-        """
-        return self._trajectory_points
+[y_motor]
+step_pin_ID = 24
+dir_pin_ID = 23
+comm_port = "/dev/ttyUSB2"
+pitch = 0.5
+rdir_ref = "counterclockwise"
+
+[y_motor.microstepping]
+resolution = "1/16"
+full_steps_per_rev = 200
+
+[y_motor.current]
+run_current_pct = 77.0
+hold_current_pct = 10.0
+""",
+        encoding="utf-8",
+    )
+    return config_path
 
 
-def test_compile_linear_axis_to_delays_and_direction():
+def test_load_axis_calibrations_from_motor_config(tmp_path):
     """
-    Compile a one-axis linear move to evenly spaced pulse delays.
+    Load pitch, microstepping, and direction from the controller TOML file.
     """
-    trajectory = compile_xyz_samples(
-        t_samples=[0.0, 1.0],
-        trajectory_points=[
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
+    calibrations = load_axis_calibrations_from_toml(_write_motor_config(tmp_path))
+
+    assert set(calibrations) == {"x", "y"}
+    assert calibrations["x"].direction_for_delta(1.0) == RotationDirection.CW
+    assert calibrations["y"].direction_for_delta(1.0) == RotationDirection.CCW
+    assert math.isclose(calibrations["x"].steps_per_unit, 50.0)
+    assert math.isclose(calibrations["y"].steps_per_unit, 1600.0)
+
+
+def test_compile_xyz_path_uses_motor_config_and_profile_pieces(tmp_path):
+    """
+    Compile a vertex path through the piece-based blended profile route.
+    """
+    compiled = compile_xyz_path(
+        vertices=[
+            (0.0, 0.0, 0.0),
+            (4.0, 0.0, 0.0),
         ],
-        calibrations={
-            "x": AxisCalibration(
-                travel_per_rev=1.0,
+        motor_config_filepath=_write_motor_config(tmp_path),
+        feed_rate=2.0,
+        dt_blends=0.0,
+        axes=("x",),
+        include_stationary_axes=False,
+    )
+
+    assert compiled.profile.pieces
+    assert len(compiled.stepper_trajectory) == 1
+    delays, direction = compiled.stepper_trajectory[0]["x"]
+    assert len(delays) == 200
+    assert direction == RotationDirection.CW
+    assert all(math.isclose(delay, 0.01 - 20e-6) for delay in delays)
+
+
+def test_compile_blended_profile_splits_piece_when_axis_reverses():
+    """
+    Split blended profile pieces at velocity sign changes.
+    """
+    profile = create_blended_xyz_profile(
+        vertices=[
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+        ],
+        dt_segments=(1.0, 1.0),
+        dt_blends=(0.0, 0.4, 0.0),
+    )
+    trajectory = compile_blended_profile(
+        profile,
+        {
+            "x": AxisCalibration.from_pitch(
+                pitch=10.0,
                 full_steps_per_rev=10,
-                microstep_factor=1,
                 positive_direction="counterclockwise",
             )
         },
         axes=("x",),
+        include_stationary_axes=False,
     )
 
-    assert len(trajectory) == 1
-    delays, direction = trajectory[0]["x"]
-    assert len(delays) == 10
-    assert isinstance(direction, RotationDirection)
-    assert direction == "counterclockwise"
-    assert all(math.isclose(delay, 0.1 - 20e-6) for delay in delays)
-
-
-def test_compile_splits_when_axis_direction_changes():
-    """
-    Split a trajectory when an axis reverses direction.
-    """
-    trajectory = compile_xyz_samples(
-        t_samples=[0.0, 1.0, 2.0],
-        trajectory_points=[
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-        ],
-        calibrations={
-            "x": AxisCalibration(
-                travel_per_rev=1.0,
-                full_steps_per_rev=10,
-                positive_direction="counterclockwise",
-            )
-        },
-        axes=("x",),
-    )
-
-    assert len(trajectory) == 2
-    assert trajectory[0]["x"][1] == "counterclockwise"
-    assert trajectory[1]["x"][1] == "clockwise"
-
-
-def test_stationary_axes_are_included_by_default():
-    """
-    Include configured stationary axes as empty pulse trains by default.
-    """
-    trajectory = compile_xyz_samples(
-        t_samples=[0.0, 1.0],
-        trajectory_points=[
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ],
-        calibrations={
-            "x": AxisCalibration(travel_per_rev=1.0, full_steps_per_rev=10),
-            "y": AxisCalibration(travel_per_rev=1.0, full_steps_per_rev=10),
-        },
-        axes=("x", "y"),
-    )
-
-    assert "y" in trajectory[0]
-    assert trajectory[0]["y"] == [[], "counterclockwise"]
-
-
-def test_compile_accepts_python_robot_like_scheme_object():
-    """
-    Compile objects that expose the python_robot Cartesian scheme surface.
-    """
-    scheme = FakeScheme([0.0, 1.0], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    trajectory = compile_xyz_stepper_trajectory(
-        scheme,
-        {"x": AxisCalibration(travel_per_rev=1.0, full_steps_per_rev=10)},
-        axes=("x",),
-    )
-    assert len(trajectory[0]["x"][0]) == 10
+    directions = [
+        segment["x"][1]
+        for segment in trajectory
+        if segment["x"][0]
+    ]
+    assert RotationDirection.CCW in directions
+    assert RotationDirection.CW in directions
