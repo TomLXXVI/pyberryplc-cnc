@@ -2,7 +2,8 @@
 NiceGUI editor for compiling XYZ CNC paths.
 
 The UI lets a user define path vertices and motion timing while reusing the
-same motor configuration TOML file as ``XYZMotionController``.
+same motor configuration TOML file as
+``pyberryplc_cnc.controller.XYZMotionController``.
 """
 
 from __future__ import annotations

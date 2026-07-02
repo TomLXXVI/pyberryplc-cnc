@@ -1,6 +1,6 @@
 # Trajectory Compiler Explained
 
-The trajectory compiler converts a CNC path in Cartesian coordinates into step-pulse data that can be executed by the `XYZMotionController`.
+The trajectory compiler converts a CNC path in Cartesian coordinates into step-pulse data that can be executed by `pyberryplc_cnc.controller.XYZMotionController`.
 
 At a high level, it answers one practical question:
 

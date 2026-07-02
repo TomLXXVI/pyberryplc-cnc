@@ -7,7 +7,7 @@ This module forms the bridge between ``python_robot.motion`` and
 1. define an XYZ path as Cartesian vertices,
 2. build a :class:`python_robot.motion.cartesian_space.BlendedPoseVectorProfile`,
 3. compile the profile pieces analytically to the JSON-ready format consumed by
-   :class:`pyberryplc_stepper.controller.XYZMotionController`.
+   :class:`pyberryplc_cnc.controller.XYZMotionController`.
 
 The motor calibration is loaded from the same TOML file used by
 ``XYZMotionController``. This keeps pin configuration, microstepping, axis pitch,
@@ -413,7 +413,7 @@ def load_axis_calibrations_from_toml(
 
     for axis in axes:
         section_name = f"{axis}_motor"
-        motor_config: dict = config.get(section_name, dict())
+        motor_config: dict | None = config.get(section_name)
         if motor_config is None:
             continue
 
@@ -922,4 +922,3 @@ def _axis_indices(axes: Sequence[str]) -> dict[str, int]:
     if unknown:
         raise ValueError(f"Unknown CNC axes: {sorted(unknown)}.")
     return {axis: valid_indices[axis] for axis in axes}
-
