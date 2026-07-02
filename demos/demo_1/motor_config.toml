@@ -1,0 +1,47 @@
+[x_motor]
+step_pin_ID = 27
+dir_pin_ID = 17
+comm_port = "/dev/ttyUSB1"
+high_sensitivity = false
+pitch = 0.25  # units: revs/mm
+rdir_ref = "clockwise"
+
+[x_motor.microstepping]
+resolution = "full"
+full_steps_per_rev = 200
+
+[x_motor.current]
+run_current_pct = 77.0
+hold_current_pct = 10.0
+
+[y_motor]
+step_pin_ID = 24
+dir_pin_ID = 23
+comm_port = "/dev/ttyUSB2"
+high_sensitivity = false
+pitch = 0.25  # units: revs/mm
+rdir_ref = "counterclockwise"
+
+[y_motor.microstepping]
+resolution = "full"
+full_steps_per_rev = 200
+
+[y_motor.current]
+run_current_pct = 77.0
+hold_current_pct = 10.0
+
+[z_motor]
+step_pin_ID = 6
+dir_pin_ID = 5
+comm_port = "/dev/ttyUSB0"
+high_sensitivity = false
+pitch = 0.25  # units: revs/mm
+rdir_ref = "counterclockwise"
+
+[z_motor.microstepping]
+resolution = "full"
+full_steps_per_rev = 200
+
+[z_motor.current]
+run_current_pct = 77.0
+hold_current_pct = 10.0

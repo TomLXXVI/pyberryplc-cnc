@@ -16,3 +16,4 @@ dist/
 .idea/
 
 *.dxf
+demos/demo_1/stepper_trajectory.json
