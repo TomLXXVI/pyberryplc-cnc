@@ -31,7 +31,12 @@ This package is intended as a practical bridge between:
 
 The package requires Python `>=3.10,<3.13`.
 
-From the repository root, install the local dependencies first:
+If you are starting from GitHub, first clone the workspace, create a virtual
+environment, and activate it. The root `python-automation` README shows those
+steps in detail.
+
+From the `python-automation` repository root, install the local dependencies
+first:
 
 ```bash
 python -m pip install -e packages/automation-motion
@@ -40,6 +45,9 @@ python -m pip install -e packages/pyberryplc-stepper
 python -m pip install -e packages/python-robot
 python -m pip install -e packages/pyberryplc-cnc
 ```
+
+The workspace install is recommended because `pyberryplc-cnc` depends on
+multiple sibling packages.
 
 For development:
 
