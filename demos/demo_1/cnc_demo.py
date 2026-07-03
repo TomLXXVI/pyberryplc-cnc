@@ -291,6 +291,7 @@ class ManualMode:
         self.S11 = main.add_marker("ManualMode.S11")
         self.S12 = main.add_marker("ManualMode.S12")
 
+    # noinspection PyAttributeOutsideInit
     def attach_controller(self, controller: XYZMotionController) -> None:
         """
         Attach a CNC controller to the subroutine.
@@ -369,6 +370,7 @@ class ManualMode:
         if self.cnc_status is None:
             return
 
+        # noinspection PyUnresolvedReferences
         if self.S0.active:
             if self.JogButtons["x+"].rising_edge:
                 self.S0.deactivate()
@@ -508,6 +510,7 @@ class AutoMode:
         controller:
             Controller used for trajectory execution.
         """
+        # noinspection PyAttributeOutsideInit
         self.cnc_controller = controller
 
     def call(self) -> None:
@@ -581,6 +584,7 @@ class AutoMode:
             if self.cnc_status.all_ready:
                 self.cnc_controller.move()
                 self.cnc_status = self.cnc_controller.get_motion_status()
+                # noinspection PyUnresolvedReferences
                 if self.cnc_status.all_finished:
                     self.TrajectoryFinished.activate()
 
